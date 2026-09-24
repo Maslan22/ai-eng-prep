@@ -1,0 +1,286 @@
+import logging
+import time
+import json
+
+from dataclasses import dataclass, field
+from openai import OpenAI
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from app.config import Settings, get_settings
+from app.schemas import AssistantResponse
+from app.tools import CALCULATOR_TOOL, SEARCH_DOCS_TOOL, execute_tool
+from app.observability import current_collector, estimate_cost
+
+
+logger = logging.getLogger(__name__)
+
+
+class LLMConfigurationError(RuntimeError):
+    pass
+
+
+class LLMResponseParsingError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    parsed: AssistantResponse
+    model: str
+    latency_ms: int
+    tool_names: list[str] = field(default_factory=list)
+    usage_in: int = 0
+    usage_out: int = 0
+
+
+@dataclass(frozen=True)
+class _RawCompletion:
+    parsed: AssistantResponse | None
+    usage_in: int
+    usage_out: int
+
+
+SYSTEM_PROMPT = """
+You are an AI engineering assistant.
+Your job is to answer clearly and pragmatically.
+Rules:
+- Be direct.
+- Do not invent missing facts.
+- If the request lacks context, say what was missing.
+- Use source_references only when  explicit source materials are provided.
+- Keep next_actions practical and short.
+""".strip()
+
+
+def build_prompt(
+    user_prompt: str,
+    retrieved_context: str | None = None,
+) -> str:
+
+    if not retrieved_context:
+        return user_prompt
+
+    return f"""
+    User question: {user_prompt}
+    Retrieved context: {retrieved_context}
+    Instructions:
+    - Answer the user's question using only the retrieved context.
+    - If context is insufficient, say it clearly.
+    - Include the source labels used in source_references.
+    """.strip()
+
+
+AGENT_SYSTEM_PROMPT = """
+You are an AI engineering assistant with a document search tool (search_docs) and a calculator tool (calculate).
+- Call search_docs when answering needs facts that might exist in the indexed documents.
+- Call calculate when the user asks for a math calculation (e.g '2 + 2', '15 * 4.5').
+- For general questions you can answer directly, do NOT call the tool.
+- When you use retrieved context, ground the answer in it and put the source labels in source_references.
+- If the tool returns nothing relevant and you lack the facts, say what's missing rather than guessing.
+""".strip()
+
+
+MAX_TOOL_ITERATIONS = 5
+
+
+class LLMClient:
+    def __init__(self, settings: Settings | None = None, local: bool = False) -> None:
+        self.settings = settings or get_settings()
+        self.local = local
+
+        if local:
+            # Ollama's OpenAI-compatible endpoint. API key is required by the SDK
+            # but ignored by Ollama - any non-empty string is valid.
+            self.client = OpenAI(
+                base_url=self.settings.local_base_url,
+                api_key="ollama",
+                timeout=self.settings.local_timeout_seconds,
+                max_retries=self.settings.openai_max_retries,
+            )
+            self.model = self.settings.local_model
+        else:
+            if not self.settings.openai_api_key:
+                raise LLMConfigurationError(
+                    "OPENAI_API_KEY is missing. Add it to your .env file before trying again."
+                )
+            self.client = OpenAI(
+                api_key=self.settings.openai_api_key,
+                timeout=self.settings.openai_timeout_seconds,
+                max_retries=self.settings.openai_max_retries,
+            )
+            self.model = self.settings.openai_model
+
+    def _structure_call(self, conversation: list) -> _RawCompletion:
+        if self.local:
+            response = self.client.chat.completions.parse(
+                model=self.model,
+                messages=conversation,
+                response_format=AssistantResponse,
+            )
+            msg = response.choices[0].message
+            return _RawCompletion(
+                parsed=msg.parsed,
+                usage_in=response.usage.prompt_tokens if response.usage else 0,
+                usage_out=response.usage.completion_tokens if response.usage else 0,
+            )
+        response = self.client.responses.parse(
+            model=self.model,
+            input=conversation,
+            text_format=AssistantResponse,
+        )
+        return _RawCompletion(
+            parsed=response.output_parsed,
+            usage_in=response.usage.input_tokens,
+            usage_out=response.usage.output_tokens,
+        )
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        stop=stop_after_attempt(3),
+        reraise=True
+    )
+    def complete(self, prompt: str, retrieved_context: str | None = None) -> LLMResponse:
+        started_at = time.perf_counter()
+        final_prompt = build_prompt(prompt, retrieved_context)
+
+        logger.info(
+            "llm_request_started model=%s prompt_length=%s has_retrieved_context=%s",
+            self.model,
+            len(final_prompt),
+            retrieved_context is not None,
+        )
+
+        try:
+            raw = self._structure_call([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": final_prompt},
+            ])
+            parsed = raw.parsed
+            usage_in = raw.usage_in
+            usage_out = raw.usage_out
+        except Exception:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            logger.exception(
+                "llm_request_failed model=%s latency_ms=%s",
+                self.model,
+                latency_ms,
+            )
+            raise
+
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+
+        if raw.parsed is None:
+            logger.error(
+                "llm_response_parse_failed model=%s latency_ms=%s",
+                self.model,
+                latency_ms,
+            )
+            raise LLMResponseParsingError(
+                "Model response could not be parsed into AssistantResponse."
+            )
+
+        collector = current_collector()
+        if collector is not None:
+            collector.record(
+                kind="generation",
+                model=self.model,
+                input_tokens=usage_in,
+                output_tokens=usage_out,
+            )
+
+        logger.info(
+            "llm_request_completed model=%s latency_ms=%s confidence=%s missing_context_count=%s next_actions_count=%s",
+            self.model,
+            latency_ms,
+            parsed.confidence,
+            len(parsed.missing_context),
+            len(parsed.next_actions),
+        )
+
+        return LLMResponse(
+            parsed=parsed,
+            model=self.model,
+            latency_ms=latency_ms,
+            usage_in=usage_in,
+            usage_out=usage_out,
+        )
+
+    def complete_with_tools(self, prompt: str) -> LLMResponse:
+        started_at = time.perf_counter()
+        input_items = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+
+        tool_calls_made = 0
+        called: list[str] = []
+
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            response = self.client.responses.parse(
+                model=self.model,
+                input=input_items,
+                tools=[SEARCH_DOCS_TOOL, CALCULATOR_TOOL],
+                text_format=AssistantResponse,
+            )
+
+            collector = current_collector()
+            if collector is not None and response.usage:
+                collector.record(
+                    kind="generation",
+                    model=self.model,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                )
+
+            function_calls = [
+                item for item in response.output if item.type == "function_call"]
+
+            if not function_calls:  # no more tool calls. model is done → final answer
+                parsed = response.output_parsed
+                if parsed is None:
+                    raise LLMResponseParsingError(
+                        "No parsed AssistantResponse and no tool call.")
+
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+
+                collector = current_collector()
+                input_tokens = collector.total_input_tokens if collector else 0
+                output_tokens = collector.total_output_tokens if collector else 0
+                cost = estimate_cost(collector) if collector else 0.0
+
+                logger.info("agent_completed tool_calls=%s tool_used=%s latency_ms=%s input_tokens=%s output_tokens=%s cost=%s",
+                            tool_calls_made, called, latency_ms, input_tokens, output_tokens, cost)
+
+                return LLMResponse(
+                    parsed=parsed,
+                    model=self.model,
+                    latency_ms=latency_ms,
+                    tool_names=called,
+                    usage_in=0,
+                    usage_out=0,
+                )
+
+            input_items += response.output
+
+            for call in function_calls:
+                args = json.loads(call.arguments)
+                logger.info(
+                    "agent_tool_call iteration=%s tool_name=%s args=%s call_id=%s",
+                    iteration + 1,
+                    call.name,
+                    args,
+                    call.call_id
+                )
+
+                called.append(call.name)
+                result = execute_tool(call.name, args)
+                tool_calls_made += 1
+
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": result,
+                })
+
+        raise RuntimeError(
+            f"Agent exceeded MAX_TOOL_ITERATIONS={MAX_TOOL_ITERATIONS}")
